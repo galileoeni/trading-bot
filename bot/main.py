@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
+from requests import exceptions as requests_exceptions
 
 load_dotenv()
 
@@ -34,11 +35,20 @@ EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "12
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
-BLOCKED_COUNTRIES = {
+RESTRICTED_COUNTRIES = {
     item.strip().upper()
-    for item in os.getenv("BOT_BLOCKED_COUNTRIES", "US,USA,UNITED STATES,UNITED STATES OF AMERICA").split(",")
+    for item in os.getenv(
+        "BOT_RESTRICTED_COUNTRIES",
+        "AU,BE,BY,BI,CF,CD,CU,DE,ET,FR,GB,IR,IQ,IT,KP,LB,LY,MM,NI,NL,PL,RU,SG,SO,SS,SD,SY,TH,TW,UM,US,VE,YE,ZW",
+    ).split(",")
     if item.strip()
 }
+RESTRICTED_REGIONS = {
+    "CA": {"ON"},
+    "UA": {"43", "14", "09"},
+}
+MUSASHI_CONNECT_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_CONNECT_TIMEOUT_SECONDS", "10"))
+MUSASHI_READ_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_READ_TIMEOUT_SECONDS", "30"))
 
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com").rstrip("/")
 POLYMARKET_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
@@ -59,7 +69,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_DIR / "bot.log"), logging.StreamHandler()],
+    handlers=[logging.FileHandler(LOG_DIR / "bot.log", mode="w"), logging.StreamHandler()],
 )
 logger = logging.getLogger("musashi-poly-bot")
 
@@ -168,6 +178,10 @@ class GeolocationClient:
             "loc": loc,
             "timezone": payload.get("timezone"),
         }
+
+
+class SafetyShutdown(RuntimeError):
+    pass
 
 
 class PolymarketMarketStream:
@@ -429,9 +443,10 @@ class MusashiClient:
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self.timeout = (MUSASHI_CONNECT_TIMEOUT_SECONDS, MUSASHI_READ_TIMEOUT_SECONDS)
 
     def health(self) -> dict[str, Any]:
-        response = self.session.get(f"{self.base_url}/api/health", timeout=20)
+        response = self.session.get(f"{self.base_url}/api/health", timeout=self.timeout)
         response.raise_for_status()
         return response.json()
 
@@ -439,7 +454,7 @@ class MusashiClient:
         response = self.session.get(
             f"{self.base_url}/api/feed",
             params={"limit": limit, "minUrgency": min_urgency},
-            timeout=30,
+            timeout=self.timeout,
         )
         response.raise_for_status()
         payload = response.json()
@@ -449,7 +464,7 @@ class MusashiClient:
         response = self.session.post(
             f"{self.base_url}/api/analyze-text",
             json={"text": text, "minConfidence": min_confidence, "maxResults": max_results},
-            timeout=30,
+            timeout=self.timeout,
         )
         response.raise_for_status()
         return response.json()
@@ -872,6 +887,7 @@ class Bot:
             if isinstance(self.trader, LiveTrader)
             else None
         )
+        self.startup_geo_profile: dict[str, str] | None = None
 
     def current_exposure(self) -> float:
         return sum(float(position.get("size_usd", 0)) for position in self.positions.values())
@@ -885,13 +901,10 @@ class Bot:
         save_json(PENDING_ORDERS_FILE, self.pending_orders)
         self.sync_realtime_subscriptions()
 
-    def log_startup_geolocation(self) -> None:
-        location = self.geolocation.locate()
-        if not location:
-            logger.info("Startup geolocation: unavailable")
-            return
+    def _log_geo(self, prefix: str, location: dict[str, Any]) -> None:
         logger.info(
-            "Startup geolocation: ip=%s city=%s region=%s country=%s loc=%s timezone=%s provider=%s",
+            "%s ip=%s city=%s region=%s country=%s loc=%s timezone=%s provider=%s",
+            prefix,
             location.get("ip"),
             location.get("city"),
             location.get("region"),
@@ -901,28 +914,62 @@ class Bot:
             location.get("provider"),
         )
 
-    def assert_geolocation_allowed(self) -> None:
+    def _normalize_geo_profile(self, location: dict[str, Any]) -> dict[str, str]:
+        return {
+            "ip": str(location.get("ip") or "").strip(),
+            "country": str(location.get("country") or "").strip().upper(),
+            "region": str(location.get("region") or "").strip().upper(),
+        }
+
+    def _assert_location_profile_allowed(self, location: dict[str, Any], context: str) -> dict[str, str]:
+        profile = self._normalize_geo_profile(location)
+        country = profile["country"]
+        region = profile["region"]
+
+        if not profile["ip"] or not country:
+            raise SafetyShutdown(f"{context}: geolocation incomplete; refusing to continue")
+        if country in RESTRICTED_COUNTRIES:
+            raise SafetyShutdown(f"{context}: restricted country detected ({country}); terminating")
+        if region and region in RESTRICTED_REGIONS.get(country, set()):
+            raise SafetyShutdown(f"{context}: restricted region detected ({country}-{region}); terminating")
+        return profile
+
+    def assert_runtime_safety(self, context: str, *, log_checks: bool = False) -> None:
         location = self.geolocation.locate()
         if not location:
-            logger.warning("Startup geolocation: unavailable")
-            return
+            raise SafetyShutdown(f"{context}: geolocation unavailable; refusing to continue")
+        if log_checks:
+            self._log_geo("Runtime geolocation:", location)
+        current_profile = self._assert_location_profile_allowed(location, context)
 
-        country = str(location.get("country") or "").strip()
-        normalized_country = country.upper()
-        logger.info(
-            "Startup geolocation: ip=%s city=%s region=%s country=%s loc=%s timezone=%s provider=%s",
-            location.get("ip"),
-            location.get("city"),
-            location.get("region"),
-            country,
-            location.get("loc"),
-            location.get("timezone"),
-            location.get("provider"),
-        )
-        if normalized_country in BLOCKED_COUNTRIES:
-            raise RuntimeError(
-                f"Startup geolocation blocked for country={country or 'unknown'}; refusing to start"
-            )
+        if self.startup_geo_profile is None:
+            self.startup_geo_profile = current_profile
+        else:
+            for key in ("ip", "country", "region"):
+                previous = self.startup_geo_profile.get(key, "")
+                current = current_profile.get(key, "")
+                if previous and current and previous != current:
+                    raise SafetyShutdown(
+                        f"{context}: detected {key} change from {previous} to {current}; terminating"
+                    )
+
+        geo = self.polymarket_public.geoblock()
+        if log_checks:
+            logger.info("Polymarket geoblock: %s", geo)
+        if bool(geo.get("blocked")):
+            raise SafetyShutdown(f"{context}: Polymarket geoblock reports blocked=true; terminating")
+
+        geo_country = str(geo.get("country") or "").strip().upper()
+        geo_region = str(geo.get("region") or "").strip().upper()
+        geo_ip = str(geo.get("ip") or "").strip()
+        if geo_country in RESTRICTED_COUNTRIES:
+            raise SafetyShutdown(f"{context}: Polymarket geoblock country is restricted ({geo_country}); terminating")
+        if geo_region and geo_region in RESTRICTED_REGIONS.get(geo_country, set()):
+            raise SafetyShutdown(f"{context}: Polymarket geoblock region is restricted ({geo_country}-{geo_region}); terminating")
+        if self.startup_geo_profile:
+            startup_ip = self.startup_geo_profile.get("ip", "")
+            if startup_ip and geo_ip and geo_ip != startup_ip:
+                raise SafetyShutdown(f"{context}: geoblock IP changed from {startup_ip} to {geo_ip}; terminating")
 
     def sync_realtime_subscriptions(self) -> None:
         asset_ids = {
@@ -984,9 +1031,32 @@ class Bot:
             if self.has_realtime_pending_updates():
                 try:
                     self.process_pending_orders()
+                except SafetyShutdown:
+                    raise
                 except Exception as exc:
                     logger.exception("Realtime pending order monitor error: %s", exc)
             time.sleep(1)
+
+    @staticmethod
+    def response_indicates_ban_risk(response: dict[str, Any]) -> bool:
+        if not isinstance(response, dict):
+            return False
+        text = json.dumps(response).lower()
+        risk_markers = (
+            "geoblock",
+            "blocked",
+            "forbidden",
+            "restricted",
+            "compliance",
+            "sanction",
+            "location",
+            "region",
+            "country",
+            "not allowed",
+            "not eligible",
+            "prohibited",
+        )
+        return any(marker in text for marker in risk_markers)
 
     def pending_exit_order_for_market(self, market_id: str) -> tuple[str, dict[str, Any]] | None:
         for order_id, pending in self.pending_orders.items():
@@ -995,13 +1065,7 @@ class Bot:
         return None
 
     def assert_live_trading_allowed(self) -> None:
-        self.assert_geolocation_allowed()
-        if BOT_MODE != "live":
-            return
-        geo = self.polymarket_public.geoblock()
-        logger.info("Polymarket geoblock: %s", geo)
-        if bool(geo.get("blocked")):
-            raise RuntimeError("Polymarket geoblock reports blocked=true for current IP; refusing to start in live mode")
+        self.assert_runtime_safety("startup", log_checks=True)
 
     def should_trade(self, signal_payload: dict[str, Any]) -> Decision | None:
         if not signal_payload.get("success"):
@@ -1125,6 +1189,7 @@ class Bot:
         return any(position.get("event_id") == event_id for position in self.positions.values())
 
     def execute_trade(self, decision: Decision) -> None:
+        self.assert_runtime_safety("pre-entry")
         market = decision.market
         market_id = str(market["id"])
 
@@ -1149,6 +1214,8 @@ class Bot:
                 "probability": decision.probability,
             },
         )
+        if self.response_indicates_ban_risk(response):
+            raise SafetyShutdown(f"pre-entry: Polymarket response indicates compliance/geoblock risk; terminating: {response}")
         fill = parse_fill_result(
             response=response,
             fallback_price=decision.probability,
@@ -1255,6 +1322,7 @@ class Bot:
         return new_side != position.get("side") and confidence >= MIN_CONFIDENCE
 
     def close_position(self, market_id: str, position: dict[str, Any], exit_reason: str, current_prob: float) -> None:
+        self.assert_runtime_safety("pre-exit")
         existing_pending = self.pending_exit_order_for_market(market_id)
         if existing_pending:
             pending_order_id, pending = existing_pending
@@ -1288,6 +1356,8 @@ class Bot:
                 "available_shares": shares,
             },
         )
+        if self.response_indicates_ban_risk(response):
+            raise SafetyShutdown(f"pre-exit: Polymarket response indicates compliance/geoblock risk; terminating: {response}")
         fill = parse_fill_result(
             response=response,
             fallback_price=limit_price,
@@ -1376,9 +1446,14 @@ class Bot:
                 continue
 
             try:
+                self.assert_runtime_safety(f"pending-order:{order_id}")
                 if self.user_stream:
                     self.user_stream.pop_order_event(order_id)
                 status_response = self.trader.get_order_status(order_id)
+                if self.response_indicates_ban_risk(status_response):
+                    raise SafetyShutdown(
+                        f"pending-order:{order_id}: Polymarket response indicates compliance/geoblock risk; terminating: {status_response}"
+                    )
                 fallback_price = as_float(pending.get("limit_price"), as_float(position.get("entry_probability"), 0.5))
                 status = parse_order_status(status_response, fallback_price=fallback_price)
                 pending["last_checked_at"] = utc_now_iso()
@@ -1449,6 +1524,8 @@ class Bot:
 
                 self.pending_orders[order_id] = pending
                 self.save_state()
+            except SafetyShutdown:
+                raise
             except Exception as exc:
                 logger.exception("Pending order monitor error for %s: %s", order_id, exc)
 
@@ -1477,9 +1554,16 @@ class Bot:
                 continue
 
             try:
+                self.assert_runtime_safety(f"startup-reconcile:{order_id}")
                 status_response = self.trader.get_order_status(order_id)
+                if self.response_indicates_ban_risk(status_response):
+                    raise SafetyShutdown(
+                        f"startup-reconcile:{order_id}: Polymarket response indicates compliance/geoblock risk; terminating: {status_response}"
+                    )
                 fallback_price = as_float(pending.get("limit_price"), as_float(position.get("entry_probability"), 0.5))
                 status = parse_order_status(status_response, fallback_price=fallback_price)
+            except SafetyShutdown:
+                raise
             except Exception as exc:
                 logger.warning("Could not reconcile pending order %s: %s", order_id, exc)
                 continue
@@ -1561,32 +1645,53 @@ class Bot:
 
     def run(self) -> None:
         try:
-            health = self.musashi.health()
-            logger.info("Musashi health: %s", bool(health.get("success")))
-        except Exception as exc:
-            logger.warning("Musashi health check failed: %s", exc)
-        logger.info(
-            "Bot mode=%s bankroll=%.2f max_position=%.2f exposure_cap=%.2f",
-            BOT_MODE,
-            BANKROLL_USD,
-            MAX_POSITION_USD,
-            MAX_TOTAL_EXPOSURE_USD,
-        )
-        self.start_realtime_streams()
-        self.reconcile_startup_state()
-
-        while True:
-            loop_started_at = time.time()
             try:
-                self.process_pending_orders()
-                self.monitor_positions()
-                feed = self.musashi.get_feed(limit=20, min_urgency="high")
-                logger.info("Fetched %d feed items", len(feed))
-                for item in feed:
-                    self.handle_feed_item(item)
+                health = self.musashi.health()
+                logger.info("Musashi health: %s", bool(health.get("success")))
             except Exception as exc:
-                logger.exception("Loop error: %s", exc)
-            self.idle_until_next_scan(loop_started_at)
+                logger.warning("Musashi health check failed: %s", exc)
+            logger.info(
+                "Bot mode=%s bankroll=%.2f max_position=%.2f exposure_cap=%.2f",
+                BOT_MODE,
+                BANKROLL_USD,
+                MAX_POSITION_USD,
+                MAX_TOTAL_EXPOSURE_USD,
+            )
+            self.start_realtime_streams()
+            self.reconcile_startup_state()
+
+            while True:
+                loop_started_at = time.time()
+                try:
+                    self.process_pending_orders()
+                    self.monitor_positions()
+                    feed = self.musashi.get_feed(limit=20, min_urgency="high")
+                    logger.info("Fetched %d feed items", len(feed))
+                    for item in feed:
+                        self.handle_feed_item(item)
+                except SafetyShutdown:
+                    raise
+                except requests_exceptions.ConnectTimeout:
+                    logger.warning(
+                        "Musashi feed connect timeout after %.1fs; retrying next cycle",
+                        MUSASHI_CONNECT_TIMEOUT_SECONDS,
+                    )
+                except requests_exceptions.ReadTimeout:
+                    logger.warning(
+                        "Musashi feed read timeout after %.1fs (connect timeout %.1fs); retrying next cycle",
+                        MUSASHI_READ_TIMEOUT_SECONDS,
+                        MUSASHI_CONNECT_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.exception("Loop error: %s", exc)
+                self.idle_until_next_scan(loop_started_at)
+        except SafetyShutdown as exc:
+            logger.critical("Safety shutdown: %s", exc)
+            raise SystemExit(1) from exc
+        finally:
+            self.market_stream.stop()
+            if self.user_stream:
+                self.user_stream.stop()
 
 
 if __name__ == "__main__":
