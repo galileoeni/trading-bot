@@ -11,9 +11,12 @@ Strategy:
 
 This is risk-free profit - no prediction needed, just math.
 """
+import csv
 import json
 import time
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from dataclasses import dataclass, field
 
@@ -89,8 +92,9 @@ class ArbitrageStrategy:
                 logger.debug("No arbitrage data from Musashi")
                 return []
 
-            arbs = response.get("arbitrage_opportunities", [])
+            arbs = response.get("data", {}).get("opportunities", [])
             if not arbs:
+                logger.info("Arbitrage scan: 0 opportunities found (spread >= %.0f%%)", MIN_SPREAD_PERCENT * 100)
                 return []
 
             opportunities: list[ArbitrageOpportunity] = []
@@ -161,6 +165,20 @@ class ArbitrageStrategy:
                     continue
 
             opportunities.sort(key=lambda x: x.profit_usd, reverse=True)
+
+            logger.info("─" * 80)
+            logger.info("ARBITRAGE SCAN — %d matched pair(s) after filters", len(opportunities))
+            for i, op in enumerate(opportunities, 1):
+                logger.info(
+                    "  #%d  spread=%.1f%%  buy=%-12s  poly=%.2f¢  kalshi=%.2f¢",
+                    i, op.spread_percent * 100, op.buy_platform.upper(),
+                    op.poly_price * 100, op.kalshi_price * 100,
+                )
+                logger.info("       POLY  : %s", op.title[:70])
+                logger.info("       KALSHI: (id %s)", op.kalshi_market_id)
+            logger.info("─" * 80)
+
+            self._log_pairs_csv(opportunities)
             return opportunities
 
         except Exception as exc:
@@ -356,6 +374,39 @@ class ArbitrageStrategy:
             logger.info(
                 "  Theoretical P&L if both legs filled: $%.4f", theoretical_pnl,
             )
+
+    # ------------------------------------------------------------------
+    # CSV logging
+    # ------------------------------------------------------------------
+
+    def _log_pairs_csv(self, opportunities: list["ArbitrageOpportunity"]) -> None:
+        """Append matched pairs to data/arbitrage_pairs.csv for documentation."""
+        from main import DATA_DIR  # noqa: PLC0415
+        csv_path = Path(DATA_DIR) / "arbitrage_pairs.csv"
+        write_header = not csv_path.exists()
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    "timestamp", "poly_title", "kalshi_id",
+                    "poly_price_cents", "kalshi_price_cents",
+                    "spread_pct", "buy_platform",
+                    "poly_vol_24h", "kalshi_vol_24h",
+                ])
+            for op in opportunities:
+                writer.writerow([
+                    ts,
+                    op.title,
+                    op.kalshi_market_id,
+                    round(op.poly_price * 100, 2),
+                    round(op.kalshi_price * 100, 2),
+                    round(op.spread_percent * 100, 2),
+                    op.buy_platform,
+                    round(op.poly_volume, 2),
+                    round(op.kalshi_volume, 2),
+                ])
+        logger.info("Pairs logged → %s", csv_path)
 
     # ------------------------------------------------------------------
     # Scanner loop
