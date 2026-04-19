@@ -25,7 +25,7 @@ logger = logging.getLogger("arbitrage")
 # Arbitrage Parameters
 MIN_SPREAD_PERCENT = 0.05   # 5% minimum spread for arbitrage
 SCAN_INTERVAL_SECONDS = 5   # Check every 5 seconds for arb opportunities
-MIN_VOLUME_USD = 50000      # $50k minimum volume for liquidity
+MIN_VOLUME_USD = 500        # $500 minimum volume for liquidity (Kalshi political markets trade low volume)
 # Position size is now driven by BOT_MAX_POSITION_USD (MAX_POSITION_USD imported
 # from main at execution time) so it stays within the same risk envelope as the
 # signal strategy.  POSITION_SIZE_USD is kept as a hard upper-cap fallback only.
